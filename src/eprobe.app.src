@@ -1,0 +1,12 @@
+{application, eprobe,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { eprobe_app, []}},
+  {env, []}
+ ]}.
