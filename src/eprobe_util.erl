@@ -1,28 +1,17 @@
 -module(eprobe_util).
+-export([etsCountAdd/4]).
 
--export([get_list_item/2, get_list_item/3]).
+-spec(etsCountAdd(EtsTab :: ets : tid() | atom(),
+                  Key :: term(), UpdateValue :: [term()], InsertValue :: term())
+      -> true | integer() ).
 
-
-%%--------------------------------------------------------------------
-%% @doc
-%% get list from proplist
-%%
-%% @spec
-%% @end
-%%--------------------------------------------------------------------
-
--spec(get_list_item(Item :: term(), ParamList :: [{term(), term()}])
-      -> term()).
--spec(get_list_item(Item :: term(), ParamList :: [{term(), term()}],
-                    Default :: term())
-      -> term()).
-
-get_list_item(Item, ParamList) ->
-    get_list_item(Item ,ParamList, undefined).
-
-get_list_item(Item, ParamList, Default) when is_list(ParamList) ->
-    case lists:keyfind(Item, 1, ParamList) of
-        {Item, Value} -> Value;
-        _ -> Default
-    end;
-get_list_item(_, _, Default) -> Default.
+etsCountAdd(EtsTab, Key, UpdateValue, InsertValue) ->
+    try ets:insert_new(EtsTab, InsertValue) of
+        false ->
+            ets:update_counter(EtsTab, Key, UpdateValue),
+            true;
+        _ ->
+            true
+    catch _:_ ->
+        false
+    end.

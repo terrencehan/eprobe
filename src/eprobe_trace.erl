@@ -1,8 +1,9 @@
 -module(eprobe_trace).
 
--export([start/1, stop/0, get_param/1, remote_listener/1]).
+-export([start/1, stop/0, remote_listener/1]).
 
--define(PT_ERROR(X, _), ok).
+-define(ERROR(_X, _), ok).
+-define(TRACE_DELIVERED_TIMEOUT, 5000).
 
 %%--------------------------------------------------------------------
 %% TraceParameter:
@@ -24,25 +25,24 @@
 %%--------------------------------------------------------------------
 
 start(Param) ->
-    case whereis(eprobe_trace_starter) of
-        undefined ->
+    Listener = proplists:get_value(<<"listener">>, Param),
+    case erlang:trace_info(self(), tracer) of
+        {tracer, []} ->
             try start_trace(Param) of
                 Tracer ->
-                    Listener = eprobe_util:get_list_item(<<"listener">>, Param),
-                    Listener ! {tracer_started, self(), Tracer},
-                    register(eprobe_trace_starter, self()),
+                    Listener ! {tracee_started, self(), Tracer},
+                    put(<<"eprobe_tracer">>, Tracer),
                     {ok, Tracer}
             catch _:_ ->
-                      %% ensure all trace is turned off
-                      erlang:trace(self(), false, [all]),
-                      erlang:trace_pattern({'_', '_', '_'}, false, [local]),
-
-                      ?PT_ERROR("an error occured when try to "
-                                "start tracing withparamter: ~p", [Param]),
+                      ?ERROR("an error occured when try to "
+                             "start tracing with paramter: ~p", [Param]),
 
                       {error, start_error}
             end;
-        _Pid -> {error, already_started}
+        {tracer, Tracer} ->
+            Listener ! {tracee_started, self(), Tracer},
+            put(<<"eprobe_tracer">>, Tracer),
+            {ok, Tracer}
     end.
 
 %%--------------------------------------------------------------------
@@ -55,24 +55,7 @@ start(Param) ->
 %%--------------------------------------------------------------------
 
 stop() ->
-    Me = self(),
-    case whereis(eprobe_trace_starter) of
-        Me ->
-            stop_trace(),
-            unregister(eprobe_trace_starter);
-        _ ->
-            ok
-    end.
-
-%%--------------------------------------------------------------------
-%% @doc
-%% Extract trace parameters from request condition.
-%%
-%% @spec
-%% @end
-%%--------------------------------------------------------------------
-get_param(Condition) ->
-    eprobe_util:get_list_item(<<"trace_param">>, Condition, []).
+    stop_trace().
 
 remote_listener(Param) ->
     Cb    = get_callback_module(Param),
@@ -80,44 +63,38 @@ remote_listener(Param) ->
     listener_loop(Param, State),
     ok.
 
-listener_loop(Param, State) ->
-    Cb = get_callback_module(Param),
-    receive
-        {tracer_started, Target, Tracer} ->
-            NewState = Cb:handle_remote_start(Target, Tracer, State),
-            listener_loop(Param, NewState);
-        {tracer_stoped, Target, Tracer, Msg} ->
-            NewState = Cb:handle_remote_stop(Target, Tracer, Msg, State),
-            AllFinished = Cb:check_remote_finished(NewState),
-            if
-                AllFinished ->
-                    Cb:handle_remote_final(NewState);
-                true ->
-                    listener_loop(Param, NewState)
-            end;
-        Other ->
-            io:format("HL DEBUG INFO:<~p:~p> ======> ~p~n", [?FILE, ?LINE, Other])
-    end.
-
 %%--------------------------------------------------------------------
 %% Internal Functions
 %%--------------------------------------------------------------------
 
 start_trace(Param) ->
-    Tracer    = spawn_tracer(Param),
-    MatchSpec = eprobe_util:get_list_item(<<"match_spec">>, Param),
-    FlagList  = eprobe_util:get_list_item(<<"flag_list">>, Param),
-    erlang:trace_pattern(on_load, MatchSpec, [local]),
-    erlang:trace_pattern({'_', '_', '_'}, MatchSpec, [local]),
+    Tracer     = spawn_tracer(Param),
+    MatchSpec  = proplists:get_value(<<"match_spec">>, Param),
+    FlagList   = proplists:get_value(<<"flag_list">>, Param),
+    TraceMFA   = proplists:get_value(<<"trace_mfa">>, Param, []),
+    PFlagList  = proplists:get_value(<<"pattern_flag_list">>, Param),
+    FTraceMFA  = proplists:get_value(<<"trace_mfa_false">>, Param, []),
+    FPFlagList = proplists:get_value(<<"pattern_flag_list_false">>, Param),
+
+    erlang:trace_pattern({'_', '_', '_'}, false, [local]),
+
+    lists:foreach(fun(MFA) ->
+                          erlang:trace_pattern(MFA, MatchSpec, PFlagList)
+                  end, TraceMFA),
+
+    lists:foreach(fun(MFA) ->
+                          erlang:trace_pattern(MFA, false, FPFlagList)
+                  end, FTraceMFA),
+
     erlang:trace(self(), true, [{tracer, Tracer} | FlagList]),
     Tracer.
 
 stop_trace() ->
-    case  erlang:trace_info(self(), tracer) of
-        {tracer, []} -> no_tracer;
-        {tracer, Tracer} ->
-            erlang:trace(all, false, [all]),
-            erlang:trace_pattern({'_', '_', '_'}, false, [local]),
+    Tracer = get(<<"eprobe_tracer">>),
+    case Tracer of
+        undefined ->
+            no_tracer;
+        Tracer ->
             Tracer ! {stop, self()}
     end.
 
@@ -125,7 +102,7 @@ ensure_delivered() ->
     Ref = erlang:trace_delivered(all),
     receive
         {trace_delivered, all, Ref} -> ok
-    after 5000 ->
+    after ?TRACE_DELIVERED_TIMEOUT ->
               {error, "wait trace_delivered timeout"}
     end.
 
@@ -137,25 +114,58 @@ init_state(Param) ->
     Module:init(Param).
 
 trace_loop(Param, State) ->
-    NewState = receive
-                   {stop, _From} ->
-                       ensure_delivered(),
-                       send_to_listener(Param, State),
-                       exit(normal);
-                   TraceMsg ->
-                       handle_trace_msg(TraceMsg, Param, State)
-               end,
-    trace_loop(Param, NewState).
+    receive
+        {stop_order} ->
+            ensure_delivered(),
+            send_to_listener(Param, State),
+            exit(normal);
+        {stop, _From} ->
+            Listener = proplists:get_value(<<"listener">>, Param),
+            Listener ! {tracee_stoped, 1, self()},
+            trace_loop(Param, State);
+        TraceMsg ->
+            NewState = handle_trace_msg(TraceMsg, Param, State),
+            trace_loop(Param, NewState)
+    end.
 
 send_to_listener(Param, State) ->
-    Listener = eprobe_util:get_list_item(<<"listener">>, Param),
+    Listener = proplists:get_value(<<"listener">>, Param),
     Module   = get_callback_module(Param),
     Msg      = Module:serialize(State),
-    Listener ! {tracer_stoped, 1, 2, Msg}.
+    Listener ! {tracer_stoped, self(), Msg}.
 
 handle_trace_msg(Msg, Param, State) ->
     Module = get_callback_module(Param),
     Module:handle_msg(Msg, State, Param).
 
 get_callback_module(Param) ->
-    binary_to_atom(eprobe_util:get_list_item(<<"callback_module">>, Param), utf8).
+    binary_to_atom(proplists:get_value(<<"callback_module">>, Param), utf8).
+
+listener_loop(Param, State) ->
+    Cb = get_callback_module(Param),
+    receive
+        {tracee_started, Target, Tracer} ->
+            NewState = Cb:handle_tracee_start(Target, Tracer, State),
+            listener_loop(Param, NewState);
+        {tracee_stoped, Target, Tracer} ->
+            NewState    = Cb:handle_tracee_stop(Target, Tracer, State),
+            AllFinished = Cb:check_tracee_finished(Tracer, NewState),
+            case AllFinished of
+                true ->
+                    Tracer ! {stop_order};
+                _ -> ok
+            end,
+            listener_loop(Param, NewState);
+        {tracer_stoped, Tracer, Msg} ->
+            NewState    = Cb:handle_tracer_stop(Tracer, Msg, State),
+            AllFinished = Cb:check_tracer_finished(NewState),
+            case AllFinished of
+                true ->
+                    Cb:handle_remote_final(NewState);
+                _ ->
+                    listener_loop(Param, NewState)
+            end;
+        _Other ->
+            ?ERROR("listener_loop received unexpected message:~p", [_Other]),
+            listener_loop(Param, State)
+    end.

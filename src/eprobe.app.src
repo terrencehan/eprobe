@@ -1,3 +1,4 @@
+%% ex: set ft=erlang:
 {application, eprobe,
  [
   {description, ""},
@@ -7,6 +8,6 @@
                   kernel,
                   stdlib
                  ]},
-  {mod, { eprobe_app, []}},
+  {mod, {eprobe_app, []}},
   {env, []}
- ]}.
+]}.

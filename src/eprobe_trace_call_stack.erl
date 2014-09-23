@@ -26,12 +26,16 @@
 
 -export([init/1, handle_msg/3, serialize/1]).
 
--export([init_listener/1, handle_remote_final/1, check_remote_finished/1,
-         handle_remote_start/3, handle_remote_stop/4]).
+-export([init_listener/1, handle_remote_final/1, check_tracee_finished/2,
+         check_tracer_finished/1, handle_tracee_start/3, handle_tracee_stop/3,
+         handle_tracer_stop/3]).
 
 -record(dump, {stack = [], us = 0, acc = []}). % per-process state
 
--record(listener_state, {counter = 0, acc =[], param = []}).
+-record(listener_state, {tracee_counter = undefined,
+                         tracer_counter = undefined,
+                         acc = [],
+                         param = []}).
 
 -define(RESOLUTION, 1000). %% us
 
@@ -42,20 +46,59 @@
 init_listener(Param) -> #listener_state{param = Param}.
 
 handle_remote_final(State) ->
-    Res = eprobe_util:get_list_item(<<"resolution">>, State#listener_state.param, ?RESOLUTION),
+    Res = proplists:get_value(<<"resolution">>,
+                              State#listener_state.param, ?RESOLUTION),
     Bin = [<<"resolution=">>, integer_to_binary(Res), <<"\n">>],
     file:write_file("stack.out", list_to_binary([Bin | State#listener_state.acc])).
 
-handle_remote_start(_Target, _Tracer, State) ->
-    State#listener_state{counter = State#listener_state.counter - 1}.
+handle_tracee_start(_Target, Tracer, State) ->
 
-handle_remote_stop(_Target, _Tracer, Msg, State) ->
-    State#listener_state{counter = State#listener_state.counter + 1,
-                         acc = [Msg | State#listener_state.acc]}.
+    Ets = case State#listener_state.tracee_counter of
+              undefined -> ets:new(tracee_counter,
+                                   [set, public, {keypos, 1},
+                                    {write_concurrency, true}]);
+              Counter -> Counter
+          end,
 
-check_remote_finished(State) ->
-    State#listener_state.counter == 0.
+    Ets2 = case State#listener_state.tracer_counter of
+               undefined -> ets:new(tracer_counter,
+                                    [set, public, {keypos, 1},
+                                     {write_concurrency, true}]);
+               Counter2 -> Counter2
+           end,
 
+    eprobe_util:etsCountAdd(Ets, Tracer, [{2, 1}], {Tracer, 1}),
+    ets:insert(Ets2, {Tracer}),
+
+    State#listener_state{tracee_counter = Ets, tracer_counter = Ets2}.
+
+handle_tracee_stop(_Target, Tracer, State) ->
+
+    Ets = State#listener_state.tracee_counter,
+
+    eprobe_util:etsCountAdd(Ets, Tracer, [{2, -1}], {Tracer, 0}),
+
+    State#listener_state{tracee_counter = Ets}.
+
+handle_tracer_stop(Tracer, Msg, State) ->
+    Ets = State#listener_state.tracer_counter,
+
+    New =
+    State#listener_state{acc = [Msg | State#listener_state.acc]},
+
+    ets:delete(Ets, Tracer),
+
+    New.
+
+check_tracee_finished(Tracer, State) ->
+    Ets         = State#listener_state.tracee_counter,
+    TracerCount = ets:lookup_element(Ets, Tracer, 2),
+    TracerCount == 0.
+
+check_tracer_finished(State) ->
+    Ets      = State#listener_state.tracer_counter,
+    AllCount = ets:info(Ets, size),
+    AllCount == 0.
 
 %%--------------------------------------------------------------------
 %% trace callback
@@ -92,7 +135,7 @@ us({Mega, Secs, Micro}) ->
     Mega * 1000 * 1000 * 1000 * 1000 + Secs * 1000 * 1000 + Micro.
 
 new_state(Param, #dump{us = Us, acc = Acc} = State, Stack, Ts) ->
-    Resolution = eprobe_util:get_list_item(<<"resolution">>, Param, ?RESOLUTION),
+    Resolution = proplists:get_value(<<"resolution">>, Param, ?RESOLUTION),
     UsTs = us(Ts),
     case Us of
         0 -> State#dump{us = UsTs, stack = Stack};
