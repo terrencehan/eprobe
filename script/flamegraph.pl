@@ -269,7 +269,6 @@ sub flow {
     }
     $len_same = $i;
 
-    # 出栈
     for ($i = $len_a; $i >= $len_same; $i--) {
         my $k = "$last->[$i];$i";
         # a unique ID is constructed from "func;depth;etime";
@@ -279,7 +278,6 @@ sub flow {
         delete $layer->{tmp}->{$k};
     }
 
-    # 进栈
     for ($i = $len_same; $i <= $len_b; $i++) {
         my $k = "$this->[$i];$i";
         $layer->{tmp}->{$k}->{stime} = $v;

@@ -1,4 +1,4 @@
-eprobe - A profiling toolkit for erlang.
+eprobe - A profiling toolkit for Erlang.
 =========================
 
 Status
@@ -18,8 +18,8 @@ Inspired by [eflame](https://github.com/proger/eflame), eprobe_trace provides a
 method to trace your application in time sequence, and visualise call stacks using Flame
 Graph.
 
-Compared to original implement, `script/flamegraph.pl` introduced a new concept
-`layer` to show the relationship between parallel processes, even those in saperated nodes.
+Compared to original implementation, `script/flamegraph.pl` introduced a new concept
+`layer` to show the relationship between parallel processes, even those in separate nodes.
 So, all processes could be combined in one flame graph, ordered by time they took.
 <p align="center">
   <img src="https://raw.github.com/terrencehan/eprobe/master/sample/flame.png?raw=true" alt=""/>
