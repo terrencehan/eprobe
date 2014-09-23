@@ -26,7 +26,7 @@ So, all processes could be combined in one flame graph, ordered by time they too
 </p>
 
 ####Example
-See [https://github.com/terrencehan/eprobe/sample/trace.erl](https://github.com/terrencehan/eprobe/sample/trace.erl)
+See [https://github.com/terrencehan/eprobe/blob/master/sample/trace.erl](https://github.com/terrencehan/eprobe/blob/master/sample/trace.erl)
 
 COPYRIGHT AND LICENCE
 ------------------------
