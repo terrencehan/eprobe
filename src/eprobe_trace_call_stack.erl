@@ -1,6 +1,5 @@
 %%--------------------------------------------------------------------
-%% This file is modified from eflame.erl
-%% (https://github.com/proger/eflame/blob/master/src/eflame.erl)
+%% This file is based on eflame.erl
 %%
 %% ORIGINAL LICENSE:
 %%

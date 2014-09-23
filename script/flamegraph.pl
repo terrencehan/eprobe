@@ -1,0 +1,519 @@
+#!/usr/bin/perl -w
+#
+# flamegraph.pl        flame stack grapher.
+#
+# This takes stack samples and renders a call graph, allowing hot functions
+# and codepaths to be quickly identified.  Stack samples can be generated using
+# tools such as DTrace, perf, SystemTap, and Instruments.
+#
+# USAGE: ./flamegraph.pl [options] input.txt > graph.svg
+#
+#        grep funcA input.txt | ./flamegraph.pl [options] > graph.svg
+#
+# Options are listed in the usage message (--help).
+#
+# The input is stack frames and sample counts formatted as single lines.  Each
+# frame in the stack is semicolon separated, with a space and count at the end
+# of the line.  These can be generated using DTrace with stackcollapse.pl,
+# and other tools using the stackcollapse variants.
+#
+# The output graph shows relative presense of functions in stack samples.  The
+# ordering on the x-axis has no meaning; since the data is samples, time order
+# of events is not known.  The order used sorts function names alphabetically.
+#
+# While intended to process stack samples, this can also process stack traces.
+# For example, tracing stacks for memory allocation, or resource usage.  You
+# can use --title to set the title to reflect the content, and --countname
+# to change "samples" to "bytes" etc.
+#
+# HISTORY
+#
+# This was inspired by Neelakanth Nadgir's excellent function_call_graph.rb
+# program, which visualized function entry and return trace events.  As Neel
+# wrote: "The output displayed is inspired by Roch's CallStackAnalyzer which
+# was in turn inspired by the work on vftrace by Jan Boerhout".  See:
+# https://blogs.oracle.com/realneel/entry/visualizing_callstacks_via_dtrace_and
+#
+# Copyright 2011 Joyent, Inc.  All rights reserved.
+# Copyright 2011 Brendan Gregg.  All rights reserved.
+#
+# CDDL HEADER START
+#
+# The contents of this file are subject to the terms of the
+# Common Development and Distribution License (the "License").
+# You may not use this file except in compliance with the License.
+#
+# You can obtain a copy of the license at docs/cddl1.txt or
+# http://opensource.org/licenses/CDDL-1.0.
+# See the License for the specific language governing permissions
+# and limitations under the License.
+#
+# When distributing Covered Code, include this CDDL HEADER in each
+# file and include the License file at docs/cddl1.txt.
+# If applicable, add the following below this CDDL HEADER, with the
+# fields enclosed by brackets "[]" replaced with your own identifying
+# information: Portions Copyright [yyyy] [name of copyright owner]
+#
+# CDDL HEADER END
+#
+# 15-Aug-2014    terrencehan     Support parallel processes
+# 17-Mar-2013    Tim Bunce       Added options and more tunables.
+# 15-Dec-2011    Dave Pacheco    Support for frames with whitespace.
+# 10-Sep-2011    Brendan Gregg   Created this.
+
+use strict;
+use POSIX;
+use Data::Dumper qw/Dumper/;
+
+use Getopt::Long;
+
+# tunables
+my $fonttype = "Menlo";
+my $imagewidth = 1360;        # max width, pixels
+my $frameheight = 16;        # max height is dynamic
+my $fontsize = 10;        # base text size
+my $fontwidth = 0.59;           # avg width relative to fontsize
+my $minwidth = 0.1;        # min function width, pixels
+my $titletext = "Flame Graph";  # centered heading
+my $nametype = "Function:";     # what are the names in the data?
+my $countname = "samples";      # what are the counts in the data?
+my $colors = "hot";        # color theme
+my $bgcolor1 = "#eeeeee";    # background color gradient start
+my $bgcolor2 = "#eeeeb0";    # background color gradient stop
+my $nameattrfile;               # file holding function attributes
+my $timemax;                    # (override the) sum of the counts
+my $factor = 1;                 # factor to scale counts by
+my $resolution = 100; # us
+my $filter = '';
+
+GetOptions(
+    'fonttype=s'  => \$fonttype,
+    'width=i'     => \$imagewidth,
+    'height=i'    => \$frameheight,
+    'fontsize=f'   => \$fontsize,
+    'fontwidth=f'  => \$fontwidth,
+    'minwidth=f'   => \$minwidth,
+    'title=s'      => \$titletext,
+    'nametype=s'   => \$nametype,
+    'countname=s'  => \$countname,
+    'nameattr=s'   => \$nameattrfile,
+    'total=s'      => \$timemax,
+    'factor=f'     => \$factor,
+    'colors=s'     => \$colors,
+    'filter=s'     => \$filter,
+    'res=i'        => \$resolution,
+) or die <<USAGE_END;
+USAGE: $0 [options] infile > outfile.svg\n
+    --title            # change title text
+    --width            # width of image (default 1200)
+    --height        # height of each frame (default 16)
+    --minwidth        # omit smaller functions (default 0.1 pixels)
+    --fonttype        # font type (default "Verdana")
+    --fontsize        # font size (default 12)
+    --countname        # count type label (default "samples")
+    --nametype        # name type label (default "Function:")
+    --colors        # "hot" or "mem" palette (default "hot")
+    eg,
+    $0 --title="Flame Graph: malloc()" trace.txt > graph.svg
+USAGE_END
+
+$imagewidth = ceil($imagewidth);
+
+# internals
+my $ypad1 = $fontsize * 4;    # pad top, include title
+my $ypad2 = $fontsize * 2 + 10;    # pad bottom, include labels
+my $xpad = 10;            # pad lefm and right
+my $depthmax = 0;
+my %Events;
+my %nameattr;
+
+if ($nameattrfile) {
+    # The name-attribute file format is a function name followed by a tab then
+    # a sequence of tab separated name=value pairs.
+    open my $attrfh, $nameattrfile or die "Can't read $nameattrfile: $!\n";
+    while (<$attrfh>) {
+        chomp;
+        my ($funcname, $attrstr) = split /\t/, $_, 2;
+        die "Invalid format in $nameattrfile" unless defined $attrstr;
+        $nameattr{$funcname} = { map { split /=/, $_, 2 } split /\t/, $attrstr };
+    }
+}
+
+if ($colors eq "mem") {
+    $bgcolor1 = "#eeeeee";
+    $bgcolor2 = "#e0e0ff";
+}
+
+# SVG functions
+{ package SVG;
+    sub new {
+        my $class = shift;
+        my $self = {};
+        bless ($self, $class);
+        return $self;
+    }
+
+    sub header {
+        my ($self, $w, $h) = @_;
+        $self->{svg} .= <<SVG;
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="$w" height="$h" onload="init(evt)" viewBox="0 0 $w $h" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+SVG
+    }
+
+    sub include {
+        my ($self, $content) = @_;
+        $self->{svg} .= $content;
+    }
+
+    sub colorAllocate {
+        my ($self, $r, $g, $b) = @_;
+        return "rgb($r,$g,$b)";
+    }
+
+    sub group_start {
+        my ($self, $attr) = @_;
+
+        my @g_attr = map {
+            exists $attr->{$_} ? sprintf(qq/$_="%s"/, $attr->{$_}) : ()
+        } qw(class style onmouseover onmouseout);
+        push @g_attr, $attr->{g_extra} if $attr->{g_extra};
+        $self->{svg} .= sprintf qq/<g %s>\n/, join(' ', @g_attr);
+
+        $self->{svg} .= sprintf qq/<title>%s<\/title>/, $attr->{title}
+            if $attr->{title}; # should be first element within g container
+
+        if ($attr->{href}) {
+            my @a_attr;
+            push @a_attr, sprintf qq/xlink:href="%s"/, $attr->{href} if $attr->{href};
+                        # default target=_top else links will open within SVG <object>
+            push @a_attr, sprintf qq/target="%s"/, $attr->{target} || "_top";
+            push @a_attr, $attr->{a_extra}                           if $attr->{a_extra};
+            $self->{svg} .= sprintf qq/<a %s>/, join(' ', @a_attr);
+        }
+    }
+
+    sub group_end {
+        my ($self, $attr) = @_;
+        $self->{svg} .= qq/<\/a>\n/ if $attr->{href};
+        $self->{svg} .= qq/<\/g>\n/;
+    }
+
+    sub filledRectangle {
+        my ($self, $x1, $y1, $x2, $y2, $fill, $extra) = @_;
+        $x1 = sprintf "%0.1f", $x1;
+        $x2 = sprintf "%0.1f", $x2;
+        my $w = sprintf "%0.1f", $x2 - $x1;
+        my $h = sprintf "%0.1f", $y2 - $y1;
+        $extra = defined $extra ? $extra : "";
+        $self->{svg} .= qq/<rect x="$x1" y="$y1" width="$w" height="$h" fill="$fill" $extra \/>\n/;
+    }
+
+    sub stringTTF {
+        my ($self, $color, $font, $size, $angle, $x, $y, $str, $loc, $extra) = @_;
+        $loc = defined $loc ? $loc : "left";
+        $extra = defined $extra ? $extra : "";
+        $self->{svg} .= qq/<text text-anchor="$loc" x="$x" y="$y" font-size="$size" font-family="$font" fill="$color" $extra >$str<\/text>\n/;
+    }
+
+    sub svg {
+        my $self = shift;
+        return "$self->{svg}</svg>\n";
+    }
+    1;
+}
+
+sub color {
+    my $type = shift;
+    return "rgb(0,0,0)" unless defined $type;
+
+    if ($type eq "hot") {
+        my $r = 205 + int(rand(50));
+        my $g = 0 + int(rand(230));
+        my $b = 0 + int(rand(55));
+        return "rgb($r,$g,$b)";
+    }
+    if ($type eq "mem") {
+        my $r = 0 + int(rand(0));
+        my $g = 190 + int(rand(50));
+        my $b = 0 + int(rand(230));
+        return "rgb($r,$g,$b)";
+    }
+    if ($type eq "blocked") {
+        my $r = 88;
+        my $g = 155;
+        my $b = 211;
+        return "rgb($r,$g,$b)";
+    }
+    if ($type eq "blank") {
+        my $r = 255;
+        my $g = 255;
+        my $b = 255;
+        return "rgb($r,$g,$b)";
+    }
+    return "rgb(0,0,0)";
+}
+
+sub flow {
+    my ($layer, $last, $this, $v, $timestamp) = @_;
+
+    my $len_a = @$last - 1;
+    my $len_b = @$this - 1;
+
+    my $i = 0;
+    my $len_same;
+    for (; $i <= $len_a; $i++) {
+        last if $i > $len_b;
+        last if $last->[$i] ne $this->[$i];
+    }
+    $len_same = $i;
+
+    # 出栈
+    for ($i = $len_a; $i >= $len_same; $i--) {
+        my $k = "$last->[$i];$i";
+        # a unique ID is constructed from "func;depth;etime";
+        # func-depth isn't unique, it may be repeated later.
+        $layer->{node}->{"$k;$v"}->{stime} = delete $layer->{tmp}->{$k}->{stime};
+        $layer->{node}->{"$k;$v"}->{abtt} = delete $layer->{tmp}->{$k}->{abtt};
+        delete $layer->{tmp}->{$k};
+    }
+
+    # 进栈
+    for ($i = $len_same; $i <= $len_b; $i++) {
+        my $k = "$this->[$i];$i";
+        $layer->{tmp}->{$k}->{stime} = $v;
+        $layer->{tmp}->{$k}->{abtt} = $timestamp;
+    }
+
+    return $this;
+}
+
+# Parse input
+my $time = 0;
+my %layers = ();
+
+my $stimestamp = 0; # start timestamp
+my $etimestamp = 0; # end timestamp
+
+#group by pid
+while (<>) {
+    chomp;
+
+    if(/^resolution=(\d+)\s+.*$/) {
+        $resolution=$1;
+        next;
+    }
+
+    my ($stack, $samples, $timestamp) = (/^([^\s]+)\s*(\d+(?:\.\d*)?)?\s*(\d+)?$/);
+
+    $samples = 1 unless (defined $samples);
+    my @stack_items = split ";", $stack;
+    my $layer_key = $stack_items[0];
+
+    $layers{$layer_key}{stack} //= [];
+    $layers{$layer_key}{time} //= 0;
+    $layers{$layer_key}{stimestamp} //= $timestamp;
+    $layers{$layer_key}{not_blank} ||= $filter ne '' && $stack =~ /$filter/ ? 1 : 0;
+
+    push $layers{$layer_key}{stack}, $_;
+    $layers{$layer_key}{time} += $samples;
+
+    my $timestamp_res = $timestamp + $resolution * $samples;
+
+    $stimestamp = $stimestamp == 0 ? $timestamp : $stimestamp < $timestamp ? $stimestamp : $timestamp;
+    $etimestamp = $etimestamp > $timestamp_res ? $etimestamp : $timestamp_res;
+
+    $layers{$layer_key}->{stimestamp}= $layers{$layer_key}->{stimestamp} < $timestamp ? $layers{$layer_key}->{stimestamp}: $timestamp;
+}
+
+
+# get max time
+my $max_group_time = 0;
+for my $key (keys %layers) {
+    $max_group_time = $layers{$key}{time} > $max_group_time ? $layers{$key}{time} : $max_group_time;
+}
+
+for my $key (keys %layers) {
+    $time = 0;
+    my $last = [];
+    my $layer = $layers{$key};
+    for (@{$layers{$key}->{stack}}) {
+        chomp;
+        my ($stack, $samples, $timestamp) = /^([^\s]+)\s*(\d+(?:\.\d*)?)?\s*(\d+)?$/;
+        $samples = 1 unless (defined $samples);
+        $stack =~ tr/<>/()/;
+        $last = flow($layer, $last, [ '', split ";", $stack ], $time, $timestamp);
+        $time += $samples;
+    }
+    flow($layer, $last, [], $time, 1);
+}
+
+die "ERROR: No stack counts found\n" unless $time;
+
+if ($timemax and $timemax < $max_group_time) {
+    warn "Specified --total $timemax is less than actual total $time, so ignored\n"
+        if $timemax/$max_group_time > 0.02; # only warn is significant (e.g., not rounding etc)
+    undef $timemax;
+}
+
+$timemax ||= $max_group_time;
+
+my $widthpertime = ($imagewidth - 2 * $xpad) / $timemax;
+my $minwidth_time = $minwidth / $widthpertime;
+
+my %Node;
+
+for my $key (keys %layers) {
+    my $layer = $layers{$key};
+
+    $layer->{depthmax} = 0;
+
+    # prune blocks that are too narrow and determine max depth
+    while (my ($id, $node) = each %{$layer->{node}}) {
+        my ($func, $depth, $etime) = split ";", $id;
+        my $stime = $node->{stime};
+        die "missing start for $id" if not defined $stime;
+
+        if (($etime-$stime) < $minwidth_time) {
+            delete $Node{$id};
+            next;
+        }
+        $layer->{depthmax} = $depth if $depth > $layer->{depthmax};
+    }
+    #$depthmax += ($depthmax == 0 ? 1 : 0) + $layer->{depthmax};
+    $depthmax += 1 + $layer->{depthmax};
+}
+
+my $time_segment = $etimestamp - $stimestamp;
+
+# Draw canvas
+my $imageheight = ($depthmax * $frameheight) + $ypad1 + $ypad2;
+my $im = SVG->new();
+$im->header($imagewidth + 300, $imageheight);
+my $inc = <<INC;
+<defs >
+    <linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+        <stop stop-color="$bgcolor1" offset="5%" />
+        <stop stop-color="$bgcolor2" offset="95%" />
+    </linearGradient>
+</defs>
+<style type="text/css">
+    .func_g:hover { stroke:#333; stroke-width:0.3; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+    var details;
+    function init(evt) { details = document.getElementById("details").firstChild; }
+    function s(info) { details.nodeValue = "$nametype " + info; }
+    function c() { details.nodeValue = ' '; }
+]]>
+</script>
+INC
+$im->include($inc);
+$im->filledRectangle(0, 0, $imagewidth, $imageheight, 'url(#background)');
+my ($white, $black, $vvdgrey, $vdgrey) = (
+    $im->colorAllocate(255, 255, 255),
+    $im->colorAllocate(0, 0, 0),
+    $im->colorAllocate(40, 40, 40),
+    $im->colorAllocate(160, 160, 160),
+    );
+$im->stringTTF($black, $fonttype, $fontsize + 5, 0.0, int($imagewidth / 2), $fontsize * 2, "$titletext($time_segment)", "middle");
+$im->stringTTF($black, $fonttype, $fontsize, 0.0, $xpad, $imageheight - ($ypad2 / 2), " ", "", 'id="details"');
+
+for my $key (keys %layers) {
+    my $layer = $layers{$key};
+    my $offset_time = int(($layer->{stimestamp} - $stimestamp) / $time_segment * $timemax);
+
+    while (my ($id, $node) = each %{$layer->{node}}) {
+        my ($func, $depth, $etime) = split ";", $id;
+        my $stime = $node->{stime};
+        my $abtt = $node->{abtt};
+
+        my $new_etime = $etime + $offset_time;
+        my $new_stime = $stime + $offset_time;
+        $layer->{new_node}->{"$func;$depth;$new_etime"}->{stime} = $new_stime;
+        $layer->{new_node}->{"$func;$depth;$new_etime"}->{abtt} = $abtt;
+    }
+    delete $layer->{node};
+    $layer->{node} = $layer->{new_node};
+}
+
+# Draw frames
+
+my $acc = 0;
+
+for my $key (sort { $layers{$b}->{time} <=> $layers{$a}->{time} } keys %layers) {
+    my $layer = $layers{$key};
+
+    my $group_base_heigth = $imageheight - $acc;
+    $acc += $layer->{depthmax} * $frameheight + $frameheight + 1;
+
+    while (my ($id, $node) = each %{$layer->{node}}) {
+
+        my ($func, $depth, $etime) = split ";", $id;
+        my $stime = $node->{stime};
+        my $abtt = $node->{abtt};
+        next if($func eq "");
+
+        $etime = $timemax if $func eq "" and $depth == 0;
+
+        my $x1 = $xpad + $stime * $widthpertime;
+        my $x2 = $xpad + $etime * $widthpertime;
+        my $y1 = $group_base_heigth - $ypad2 - ($depth + 1) * $frameheight + 1;
+        my $y2 = $group_base_heigth - $ypad2 - $depth * $frameheight;
+
+        my $samples = sprintf "%.0f", ($etime - $stime) * $factor;
+        (my $samples_txt = $samples) # add commas per perlfaq5
+            =~ s/(^[-+]?\d+?(?=(?>(?:\d{3})+)(?!\d))|\G\d{3}(?=\d))/$1,/g;
+
+        my $info;
+        if ($func eq "" and $depth == 0) {
+            $info = "all ($samples_txt $countname, 100%)";
+        } else {
+            my $pct = sprintf "%.2f", ((100 * $samples) / ($timemax * $factor));
+            my $escaped_func = $func;
+            $escaped_func =~ s/&/&amp;/g;
+            $escaped_func =~ s/</&lt;/g;
+            $escaped_func =~ s/>/&gt;/g;
+            $info = "$escaped_func ($samples_txt $countname, $pct%)";
+        }
+
+        my $nameattr = { %{ $nameattr{$func}||{} } }; # shallow clone
+        $nameattr->{class}       ||= "func_g";
+        $nameattr->{onmouseover} ||= "s('".$info.$abtt."')";
+        $nameattr->{onmouseout}  ||= "c()";
+        $nameattr->{title}       ||= $info.$abtt;
+        $im->group_start($nameattr);
+
+        my $color;
+        if($filter ne '') {
+            if($layer->{not_blank}) {
+                $color = color($func eq "sleep" ? "blocked" : $colors),
+            }
+            else {
+                $color = color("blank"),
+            }
+        }
+        else {
+                $color = color($func eq "sleep" ? "blocked" : $colors),
+        }
+        $im->filledRectangle($x1, $y1, $x2, $y2, $color, 'rx="2" ry="2"');
+
+        my $chars = int( ($x2 - $x1) / ($fontsize * $fontwidth));
+        if ($chars >= 3) { # room for one char plus two dots
+            my $text = substr $func, 0, $chars;
+            substr($text, -2, 2) = ".." if $chars < length $func;
+            $text =~ s/&/&amp;/g;
+            $text =~ s/</&lt;/g;
+            $text =~ s/>/&gt;/g;
+            $im->stringTTF($black, $fonttype, $fontsize, 0.0, $x1 + 3, 3 + ($y1 + $y2) / 2, $text, "");
+        }
+
+        $im->group_end($nameattr);
+    }
+}
+
+#print Dumper \%layers;
+
+print $im->svg;
