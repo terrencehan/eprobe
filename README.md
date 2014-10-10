@@ -28,6 +28,11 @@ So, all processes could be combined in one flame graph, ordered by time they too
 ####Example
 See [https://github.com/terrencehan/eprobe/blob/master/sample/trace.erl](https://github.com/terrencehan/eprobe/blob/master/sample/trace.erl)
 
+    $ cd sample
+    $ ./trace.erl
+    $ ../script/stack_to_flame.sh < stack.out > flame.svg
+
+
 COPYRIGHT AND LICENCE
 ------------------------
 
